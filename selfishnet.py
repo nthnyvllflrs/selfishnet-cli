@@ -30,6 +30,7 @@ Examples:
 
 import argparse
 import ctypes
+import os
 import platform
 import subprocess
 import sys
@@ -52,6 +53,10 @@ except Exception:  # pragma: no cover - platform/driver dependent
 # Cap sentinels used throughout: None = unlimited, 0 = block, >0 = kbps.
 UNLIMITED = None
 BLOCK = 0
+
+# Auto-loaded when no targets are passed on the command line.
+DEFAULT_CONFIG = "devices.txt"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 # --------------------------------------------------------------------------- #
@@ -266,6 +271,17 @@ def set_forwarding(enable, iface):
 # --------------------------------------------------------------------------- #
 # CLI parsing
 # --------------------------------------------------------------------------- #
+def cap_from_str(v):
+    """A single rate field -> UNLIMITED / BLOCK / kbps int. Raises ValueError."""
+    v = v.strip().lower()
+    if v in ("", "-", "*", "unlimited", "none"):
+        return UNLIMITED
+    n = int(v)  # ValueError on junk
+    if n < 0:
+        raise ValueError(f"negative rate '{v}'")
+    return BLOCK if n == 0 else n
+
+
 def parse_limit(spec):
     """'IP:DOWN:UP' -> (ip, down, up). Empty field = unlimited, 0 = block."""
     parts = spec.split(":")
@@ -273,17 +289,45 @@ def parse_limit(spec):
         raise argparse.ArgumentTypeError(
             f"--limit must be IP:DOWN:UP (kbps), got '{spec}'")
     ip, d, u = parts
+    try:
+        return ip, cap_from_str(d), cap_from_str(u)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"{e} in '{spec}'")
 
-    def cap(v):
-        if v == "":
-            return UNLIMITED
-        try:
-            n = int(v)
-        except ValueError:
-            raise argparse.ArgumentTypeError(f"bad rate '{v}' in '{spec}'")
-        return BLOCK if n == 0 else n
 
-    return ip, cap(d), cap(u)
+def load_config(path):
+    """
+    Parse a devices file into {ip: (down_cap, up_cap)}.
+
+    One device per line:
+        IP  DOWN  UP     (kbps; number=cap, 0=block dir, -/*/blank=unlimited)
+        IP  block        (block the device entirely)
+    '#' starts a comment; spaces, commas, or colons separate fields.
+    """
+    targets = {}
+    try:
+        fh = open(path, "r", encoding="utf-8")
+    except OSError as e:
+        sys.exit(f"Could not read config '{path}': {e}")
+    with fh:
+        for lineno, raw in enumerate(fh, 1):
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            tokens = line.replace(",", " ").replace(":", " ").split()
+            ip = tokens[0]
+            try:
+                if len(tokens) >= 2 and tokens[1].lower() == "block":
+                    down = up = BLOCK
+                else:
+                    down = cap_from_str(tokens[1]) if len(tokens) >= 2 else UNLIMITED
+                    up = cap_from_str(tokens[2]) if len(tokens) >= 3 else UNLIMITED
+            except ValueError as e:
+                sys.exit(f"{path}:{lineno}: {e}")
+            targets[ip] = (down, up)
+    if not targets:
+        sys.exit(f"No devices found in '{path}'.")
+    return targets
 
 
 def build_parser():
@@ -300,6 +344,8 @@ def build_parser():
                    help="rate-limit a device, kbps; empty field=unlimited, 0=block")
     p.add_argument("--block", dest="blocks", action="append", default=[],
                    metavar="IP", help="block a device entirely (repeatable)")
+    p.add_argument("-c", "--config", metavar="FILE",
+                   help="read targets from a file (IP DOWN UP per line, kbps)")
     p.add_argument("--duration", type=int, help="auto-stop after N seconds")
     p.add_argument("--no-forward", action="store_true",
                    help="don't toggle Windows IP forwarding (do it yourself)")
@@ -375,9 +421,21 @@ def main():
         print_devices(scan(cidr), args.gateway or default_gateway())
         return
 
-    if not args.limits and not args.blocks:
+    # If no targets were given anywhere, fall back to a devices.txt in the
+    # current folder or next to the script -- so a plain `python selfishnet.py`
+    # "just works" once you've created the file.
+    config_path = args.config
+    if config_path is None and not args.limits and not args.blocks:
+        for cand in (DEFAULT_CONFIG, os.path.join(SCRIPT_DIR, DEFAULT_CONFIG)):
+            if os.path.isfile(cand):
+                config_path = cand
+                print(f"No targets given; using device list: {cand}")
+                break
+
+    if not args.limits and not args.blocks and not config_path:
         build_parser().print_help()
-        sys.exit("\nNothing to do: pass --scan, --limit, or --block.")
+        sys.exit("\nNothing to do: create a devices.txt, or pass "
+                 "--scan / --limit / --block / --config.")
 
     if not is_admin():
         sys.exit("Administrator privileges required (Npcap + WinDivert need a driver).")
@@ -386,8 +444,10 @@ def main():
     if not gateway:
         sys.exit("Could not determine gateway; pass --gateway IP.")
 
-    # Merge --limit and --block into one target map. --block wins (both dirs 0).
+    # Merge config file first, then CLI flags so the command line can override.
     targets = {}
+    if config_path:
+        targets.update(load_config(config_path))
     for ip, d, u in args.limits:
         targets[ip] = (d, u)
     for ip in args.blocks:

@@ -54,7 +54,34 @@ Repeat `--limit` / `--block` for multiple devices. On exit (Ctrl-C or
 `--duration`) the tool heals the ARP caches and disables the forwarding it
 enabled.
 
+### Config file (multiple devices)
+Keep a device list in a file so you don't retype `--limit` flags. If a
+`devices.txt` exists in the current folder (or next to the script), it's loaded
+**automatically** — no flag needed:
+
+```powershell
+copy devices.example.txt devices.txt   # make your list once, edit in Notepad
+python selfishnet.py                    # auto-loads devices.txt and runs
+```
+
+Or point at a specific file with `--config`:
+```powershell
+python selfishnet.py --config guests.txt
+```
+
+One device per line — `IP DOWN UP` in kbps (see `devices.example.txt`):
+```
+# ip            down   up      (number=cap, 0=block dir, - or blank=unlimited)
+192.168.1.42    500    200
+192.168.1.50    1000   -       # download capped, upload unlimited
+192.168.1.77    block          # blocked entirely
+```
+Fields may be separated by spaces, commas, or colons; `#` starts a comment.
+Any `--limit`/`--block` flags given on the command line override file entries
+for the same IP.
+
 ### Other flags
+- `--config FILE` / `-c` — read targets from a device list file
 - `--range CIDR` — scan range (default: local `/24`)
 - `--iface "Wi-Fi"` — interface friendly name (used for `netsh` forwarding)
 - `--gateway IP` — override gateway auto-detection

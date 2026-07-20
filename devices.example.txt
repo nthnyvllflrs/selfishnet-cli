@@ -1,0 +1,17 @@
+# SelfishNet CLI - device list
+#
+# One device per line:  IP  DOWN  UP   (rates in kbps)
+#   DOWN / UP:  a number = cap that direction
+#               0         = block that direction
+#               - or blank = unlimited
+#   or:  IP  block        = block the device entirely
+#
+# Fields may be separated by spaces, commas, or colons.
+# Lines starting with '#' (and blank lines) are ignored.
+#
+# Copy this to devices.txt, edit, then run:
+#   python selfishnet.py --config devices.txt
+
+192.168.1.42    500     200      # phone: 500k down / 200k up
+192.168.1.50    1000    -        # laptop: cap download, upload unlimited
+192.168.1.77    block            # kick this one off entirely
