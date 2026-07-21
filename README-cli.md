@@ -31,6 +31,18 @@ budget of zero.
 3. Run from an **elevated** (Administrator) terminal — both drivers require it.
 4. If Windows Defender/AV quarantines the WinDivert driver, add an exclusion.
 
+## Easiest launch: `run.bat`
+
+Double-click **`run.bat`** (or run it from a terminal). It auto-elevates to
+Administrator via a UAC prompt, then runs the tool from its own folder. Any
+arguments are forwarded:
+
+```bat
+run.bat                     :: no args -> auto-loads devices.txt
+run.bat --scan              :: scan the LAN
+run.bat --config guests.txt :: use a specific list
+```
+
 ## Usage
 
 ```powershell
@@ -78,7 +90,13 @@ One device per line — `IP DOWN UP` in kbps (see `devices.example.txt`):
 ```
 Fields may be separated by spaces, commas, or colons; `#` starts a comment.
 Any `--limit`/`--block` flags given on the command line override file entries
-for the same IP.
+for the same IP (and are "pinned" — live reload won't touch them).
+
+**Live reload:** while the tool is running, editing and saving `devices.txt`
+applies within ~2 seconds — **no restart needed**. Add a device and it's spoofed
+and limited on the fly; change a cap and it updates; remove a line and that
+device is un-spoofed and its ARP cache healed. A malformed edit is logged and
+ignored (the running config stays intact).
 
 ### Other flags
 - `--config FILE` / `-c` — read targets from a device list file
